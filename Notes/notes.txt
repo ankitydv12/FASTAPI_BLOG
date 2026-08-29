@@ -1,0 +1,31 @@
+FastApi is backend framework , it is used to build backend logic
+
+Features:
+   *  Automatic api Documentation
+   *  Build in Validation
+
+Create a Obj of the fastapi
+    app =FastAPI()
+  "The app obj is used in router with decorator , Example: @app.get() , @app.put() "
+
+How to run fast api :
+    fastapi dev filename.py -> this for development , automatic reload the server when the changes are  made
+    fastapi run filename.py -> this for production
+
+return the list  of dict:
+    fast api automatically convert list of dict to array of json
+
+returning the  html response :
+    from fastapi.responses import HTMLResponses
+
+    @app.get("/",response_class=HTMLResponse)
+    def home():
+    return {"message": "Hello World"} #this will return json to the endpoint
+    return f"<h1>Hello World</h1>"
+
+#  same content on the multiple url
+@app.get("/",response_class=HTMLResponse)
+@app.get("/home",response_class=HTMLResponse)
+
+# showing only the developement api not browser or user
+@app.get("/",response_class=HTMLResponse , include_in_schema=False)
