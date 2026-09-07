@@ -1,8 +1,11 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
-#creating a fastapi object , the fastapi object is used to route the reuest
+from urllib.request import Request
+
+from fastapi import FastAPI , Request
+from fastapi.templating import Jinja2Templates
 
 app = FastAPI()
+templates = Jinja2Templates(directory="template")
+
 
 post :  list[dict] = [
     {
@@ -22,12 +25,11 @@ post :  list[dict] = [
 ]
 
 #  same content on the multiple url
-@app.get("/",response_class=HTMLResponse , include_in_schema=False)
-@app.get("/home",response_class=HTMLResponse)
-def home():
-    # return {"message": "Hello World"} #this will return json to the endpoint
+@app.get("/")
+@app.get("/home" , include_in_schema=False)
+def home(request: Request):
+    return templates.TemplateResponse(request,"home.html",{"post":post})
 
-    return f"<h1>Hello World</h1>" #returning the html response
 
 @app.get("/api/posts")
 def get_posts():
