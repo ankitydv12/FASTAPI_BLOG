@@ -24,11 +24,13 @@ post :  list[dict] = [
     },
 ]
 
+title = "Abc title "
+
 #  same content on the multiple url
 @app.get("/")
 @app.get("/home" , include_in_schema=False)
 def home(request: Request):
-    return templates.TemplateResponse(request,"home.html",{"post":post})
+    return templates.TemplateResponse(request,"home.html",{"post":post,"title":title})
 
 
 @app.get("/api/posts")
