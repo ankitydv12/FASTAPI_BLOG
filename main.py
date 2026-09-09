@@ -3,9 +3,12 @@ from urllib.request import Request
 from fastapi import FastAPI , Request
 from fastapi.templating import Jinja2Templates
 
-app = FastAPI()
-templates = Jinja2Templates(directory="template")
+from fastapi.staticfiles import StaticFiles
 
+app = FastAPI()
+templates = Jinja2Templates(directory="templates")
+
+app.mount("/static",StaticFiles(directory="static"),name="static")
 
 post :  list[dict] = [
     {
@@ -27,10 +30,10 @@ post :  list[dict] = [
 title = "Abc title "
 
 #  same content on the multiple url
-@app.get("/")
-@app.get("/home" , include_in_schema=False)
+@app.get("/",include_in_schema=False ,name="home")
+@app.get("/post" , include_in_schema=False,name="post")
 def home(request: Request):
-    return templates.TemplateResponse(request,"home.html",{"post":post,"title":title})
+    return templates.TemplateResponse(request,"home.html",{"posts":post,"title":title})
 
 
 @app.get("/api/posts")
