@@ -1,182 +1,202 @@
-PATH PARAMETER: VALIDATION AND HANDLING
+
+PYDANTIC SCHEMAS AND FASTAPI VALIDATION
 =======================================
 
-1. URL parameter
----------------
-The route `/api/post/{post_id}` contains a path parameter named `post_id`:
+These notes explain how `schema.py` works with the API endpoints in `main.py`.
 
-	@app.get("/api/post/{post_id}")
-	def get_posts(post_id: int):
+1. What is a schema?
+--------------------
+A schema is a contract for data. It describes:
 
-The type annotation `post_id: int` tells FastAPI to convert the value from the
-URL into an integer before calling the function.
+- which fields are expected;
+- the type of each field;
+- rules such as minimum and maximum length; and
+- the shape of the data returned by an endpoint.
 
-Examples:
+FastAPI uses Pydantic models as schemas. Pydantic reads incoming data, checks it,
+converts compatible values when possible, and reports invalid data clearly.
 
-- `/api/post/1` is valid and passes `1` to the function.
-- `/api/post/abc` is invalid because `abc` is not an integer.
-- `/api/post/999` has a valid integer, but the post may not exist.
 
-The page route `/posts/{post_id}` uses the same path-parameter idea. It receives
-a `Request` object as well because it returns an HTML template.
+2. The base model: PostBase
+---------------------------
+`PostBase` inherits from `BaseModel`, so Pydantic validates every instance of it.
 
-Conceptually, a path parameter identifies a resource inside the URL. It is
-different from a query parameter: `/api/post/1` identifies post 1 as part of
-the URL path, while a query parameter would look like `/api/post?post_id=1`.
-FastAPI reads the route template, matches the incoming URL, converts the value
-according to its type annotation, and only then calls the route function.
+	class PostBase(BaseModel):
+		title: str = Field(min_length=1, max_length=50)
+		author: str = Field(min_length=1, max_length=20)
+		content: str = Field(min_length=1)
 
-2. HttpException
-----------------
-`HTTPException` is used when the request is understood but cannot be completed.
-In this project, it is raised when the requested post does not exist:
+The fields mean:
 
-	raise HTTPException(
-		status_code=status.HTTP_404_NOT_FOUND,
-		detail=f"{post_id} does not exist"
-	)
+- `title` must be a string from 1 to 50 characters;
+- `author` must be a string from 1 to 20 characters; and
+- `content` must be a string with at least 1 character.
 
-Raising the exception stops the route and sends an error response. `detail`
-contains the explanation that can be returned to the client.
+Because these fields have no default values, they are required. An absent field,
+an incorrect type, or a value that violates a `Field` rule causes validation to
+fail before the endpoint function runs.
 
-Conceptually, an exception is an early exit from normal request processing. It
-is preferable to returning an error dictionary manually because FastAPI can
-carry the intended HTTP status code and route the error to a registered
-exception handler. The client receives an error response instead of a normal
-successful response.
+Important distinction:
 
-3. Status code
---------------
-A status code describes the result of an HTTP request.
+- `str` checks the data type.
+- `min_length` and `max_length` check the size of a string.
+- `Field(...)` adds constraints and metadata to a field.
 
-- `404 NOT FOUND`: the path parameter is valid, but no matching post exists.
-- `422 UNPROCESSABLE CONTENT`: the path parameter fails FastAPI validation,
-  such as when `post_id` is `abc` instead of an integer.
 
-The project uses named constants such as
-`status.HTTP_404_NOT_FOUND` and `status.HTTP_422_UNPROCESSABLE_CONTENT` instead
-of writing numeric values directly. This makes the code easier to understand.
+3. Request validation with PostCreate
+--------------------------------------
+`PostCreate` inherits all fields and rules from `PostBase`:
 
-HTTP status codes are grouped by their first digit: 2xx means success, 4xx
-means the client request cannot be fulfilled as sent, and 5xx means a server
-failure. A status code is part of the HTTP response metadata; it is separate
-from the response body, which may contain JSON or HTML explaining the result.
+	class PostCreate(PostBase):
+		pass
 
-4. RequestValidationError
--------------------------
-FastAPI raises `RequestValidationError` when incoming request data does not
-match the type or rules declared by the route. For this project, requesting
-`/api/post/not-a-number` causes validation to fail because `post_id` is declared
-as an `int`.
+The `pass` means that this model currently adds nothing new. It is still useful
+because it gives the incoming-create request its own meaningful name. Later, the
+create request could gain rules without changing the shared base model.
 
-This error happens before `get_posts()` runs. It is different from a 404:
+In `main.py`:
 
-- Invalid path value: `RequestValidationError`, status 422.
-- Valid path value with no matching post: `HTTPException`, status 404.
+	@app.post("/api/posts", response_model=PostResponse)
+	def create_post(post: PostCreate):
 
-`exception.errors()` returns detailed validation information, including the
-location of the invalid value, an error message, and the error type.
+The type annotation `post: PostCreate` tells FastAPI to treat the request body as
+JSON and validate it as a `PostCreate` object.
 
-Validation protects the route from receiving data in an unexpected shape. It
-also gives API clients a predictable 422 response instead of allowing a type
-conversion error to occur inside the business logic. The handler can expose
-the detailed errors to API clients, while a browser page can show a simpler
-message.
+Example valid request:
 
-5. JSONResponse
----------------
-`JSONResponse` creates a response with a JSON body and an explicit status code.
-The project uses it for API errors:
+	{
+	  "title": "Learning FastAPI",
+	  "author": "A student",
+	  "content": "Pydantic checks my request data."
+	}
 
-	return JSONResponse(
-		status_code=exception.status_code,
-		content={"detail": message},
-	)
+Example invalid requests include:
 
-Values inside `content` must be JSON serializable. Strings, numbers, lists, and
-dictionaries are valid JSON values. A Python `set` is not JSON serializable.
-For example, `{message}` creates a set, not a one-item dictionary or string,
-and causes `TypeError: Object of type set is not JSON serializable`. The project
-correctly keeps `message` as a string and places it in `{"detail": message}`.
+- a missing `title`;
+- an empty `content`;
+- a title longer than 50 characters; or
+- an author longer than 20 characters.
 
-JSON is a language-independent text format based on objects, arrays, strings,
-numbers, booleans, and null. Python values are converted to JSON during
-response serialization. Because JSON has no set type, Python sets must be
-converted to lists before being placed in a JSON response. The `content`
-argument represents the body, while `status_code` represents the HTTP metadata.
+For invalid request data, FastAPI normally returns HTTP 422 and does not call
+`create_post`. This protects the endpoint from operating on data that does not
+match its contract.
 
-6. HttpException (Starlette)
------------------------------
-FastAPI is built on Starlette. The project imports Starlette's exception class
-with an alias:
 
-	from starlette.exceptions import HTTPException as StarletteHTTPException
+4. Response validation with PostResponse
+----------------------------------------
+`PostResponse` also inherits the three post fields, then adds fields required in
+an API response:
 
-This type is used when registering the general exception handler:
+	class PostResponse(PostBase):
+		model_config = ConfigDict(from_attributes=True)
+		id: int
+		date_posted: str
 
-	@app.exception_handler(StarletteHTTPException)
+Therefore, a response must contain:
 
-FastAPI's `HTTPException` can therefore be handled by Starlette's common HTTP
-exception mechanism. The handler can read `exception.status_code` and
-`exception.detail` from the exception object.
+- `id` as an integer;
+- `title` as a string from 1 to 50 characters;
+- `author` as a string from 1 to 20 characters;
+- non-empty `content`; and
+- `date_posted` as a string.
 
-Starlette provides the lower-level web framework used by FastAPI for routing,
-requests, responses, and exception processing. Registering a handler for the
-Starlette HTTP exception type lets this application customize the default
-format of errors generated by FastAPI and Starlette. The alias avoids confusing
-the Starlette class with FastAPI's similarly named import.
+`response_model=PostResponse` tells FastAPI to validate and serialize the value
+returned by the endpoint. It also filters the response to the fields declared by
+the model. This is useful because internal fields should not accidentally leak
+to API consumers.
 
-7. validation_Exception_handler
--------------------------------
-This function handles request validation errors for the whole application:
+The create endpoint returns a newly built dictionary containing all required
+response fields. The list and single-post endpoints use the same response model:
+
+	@app.get("/api/posts", response_model=list[PostResponse])
+	@app.get("/api/post/{post_id}", response_model=PostResponse)
+
+The first route validates every item in the returned list. The second validates
+one returned post. If the application returns data that does not satisfy the
+response model, FastAPI raises a server-side response validation error. Request
+validation protects the application from the client; response validation
+protects the client from an incorrectly shaped API response.
+
+
+5. Request validation versus response validation
+------------------------------------------------
+
+Request validation:
+
+- happens before the endpoint function runs;
+- uses `post: PostCreate`;
+- checks client input; and
+- normally produces HTTP 422 for invalid input.
+
+Response validation:
+
+- happens after the endpoint function returns;
+- uses `response_model=PostResponse` or `list[PostResponse]`;
+- checks the server's output; and
+- documents and controls the public response shape.
+
+Simple flow:
+
+	Client JSON -> PostCreate validation -> endpoint function
+				-> Python dictionary -> PostResponse validation -> Client JSON
+
+
+6. Custom validation error handling
+-----------------------------------
+`main.py` registers:
 
 	@app.exception_handler(RequestValidationError)
-	def validation_Exception_handler(request: Request,
-									 exception: RequestValidationError):
 
-For API paths, it returns validation details as JSON:
+When FastAPI rejects request data, `exception.errors()` contains structured
+details such as the location of the bad value, the error type, and a message.
 
-	JSONResponse(
-		status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-		content={"details": exception.errors()},
-	)
+For API routes, the handler returns JSON with status 422:
 
-For non-API paths, it returns the error page with a general message. The
-function checks `request.url.path.startswith("/api")` to choose between the
-JSON response and the page response.
+	{"details": exception.errors()}
 
-An exception handler is application-level error middleware: it receives the
-request and the exception, converts the failure into a response, and prevents
-the exception from becoming an unformatted server error. Registering it with
-`@app.exception_handler(...)` applies the rule to matching errors across all
-routes.
+For browser/template routes, it renders `error.html` instead. This is a good
+example of choosing an error format based on the kind of client making the
+request.
 
-8. general_http_exception_handler
----------------------------------
-This function handles Starlette HTTP exceptions for the application:
-
-	@app.exception_handler(StarletteHTTPException)
-	def general_http_exception_handler(request: Request,
-									   exception: StarletteHTTPException):
-
-It first uses the exception detail, or a fallback message when no detail is
-provided:
-
-	message = exception.detail or "An error occurred"
-
-For an API URL, it returns JSON containing the error detail and keeps the
-original exception status code. For a normal page URL, it returns the error
-template and passes the status code and message to that template.
-
-This gives the same backend error a suitable format for both clients:
-
-- API request: JSON response such as `{"detail": "post not found"}`.
-- Page request: HTML error response with the matching HTTP status code.
-
-The handler demonstrates content negotiation by request category. API clients
-usually need machine-readable JSON, while browser users need a rendered page.
-The request path is used here as a simple project rule for deciding which
-representation to return. In a larger API, this decision could also use the
-request's `Accept` header or separate routers for API and page endpoints.
+The other handler, for `StarletteHTTPException`, handles errors such as a missing
+post. API clients receive JSON, while normal web pages receive the error template.
 
 
+7. `from_attributes=True`
+-------------------------
+`ConfigDict(from_attributes=True)` allows Pydantic to create a response model
+from object attributes, not only from dictionaries. This is especially useful
+when an application later returns ORM/database objects such as `post.id` and
+`post.title`.
+
+The current application returns dictionaries, so the setting is harmless and
+keeps the response model ready for database integration.
+
+
+8. Important observations in this example
+------------------------------------------
+
+- `PostCreate` is for input and intentionally has no `id` or `date_posted`.
+- `PostResponse` is for output and requires `id` and `date_posted`.
+- The create endpoint currently creates `date_posted` itself instead of asking
+  the client to provide it. This is usually the safer design because the server
+  controls generated metadata.
+- In `create_post`, the expression `max(p["id"] for p in posts) + 1 if post else 1`
+  checks `post`, which is a request object and is normally truthy. Conceptually,
+  an empty-list check should examine `posts`, not `post`, otherwise `max()` would
+  fail when the storage list is empty.
+- There are two Python functions named `get_posts`. The later definition replaces
+  the earlier Python name, even though FastAPI has already registered the routes.
+  Different function names would make the code clearer.
+
+
+9. Mental model
+---------------
+Think of Pydantic as a gatekeeper and a formatter:
+
+- before the endpoint: it checks whether client data is acceptable;
+- after the endpoint: it checks whether server data matches the promised API;
+- in both directions: it gives the data a predictable, documented shape.
+
+This separation makes APIs easier to test, safer to change, and easier for other
+developers to use.
