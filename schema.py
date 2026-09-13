@@ -26,7 +26,7 @@ class PostBase(BaseModel):
     title : str = Field(min_length=1 , max_length= 50)
     content : str = Field(min_length=1)
     
-class Patch_post(PostBase):
+class PostUpdate(PostBase):
     title : str | None = Field(min_length=1,max_length=50,default=None)
     content : str | None = Field(min_length=1,default=None)
 
