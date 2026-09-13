@@ -1,202 +1,195 @@
+# FastAPI + SQLAlchemy + Pydantic — Revision Notes
+(Based on a Blog API/Website project: Users & Posts)
 
-PYDANTIC SCHEMAS AND FASTAPI VALIDATION
-=======================================
+---
 
-These notes explain how `schema.py` works with the API endpoints in `main.py`.
+## 1. Overall Architecture
 
-1. What is a schema?
---------------------
-A schema is a contract for data. It describes:
+A typical FastAPI project splits into 4 files:
 
-- which fields are expected;
-- the type of each field;
-- rules such as minimum and maximum length; and
-- the shape of the data returned by an endpoint.
+| File | Purpose |
+|---|---|
+| `database.py` | Engine, session factory, `Base` class, `get_db()` dependency |
+| `model.py` | SQLAlchemy ORM models (tables) |
+| `schema.py` | Pydantic models (request/response validation) |
+| `main.py` | Routes (API endpoints + HTML pages), app setup, exception handlers |
 
-FastAPI uses Pydantic models as schemas. Pydantic reads incoming data, checks it,
-converts compatible values when possible, and reports invalid data clearly.
+**Why separate schema from model?**
+- `model.py` = how data is stored in DB (SQLAlchemy)
+- `schema.py` = how data looks going in/out of the API (Pydantic)
+- Keeps DB internals hidden from API consumers, allows different shapes for create/update/response.
 
+---
 
-2. The base model: PostBase
----------------------------
-`PostBase` inherits from `BaseModel`, so Pydantic validates every instance of it.
+## 2. database.py — Engine & Session
 
-	class PostBase(BaseModel):
-		title: str = Field(min_length=1, max_length=50)
-		author: str = Field(min_length=1, max_length=20)
-		content: str = Field(min_length=1)
+```python
+engine = create_engine(url, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+```
 
-The fields mean:
+- **Engine** = connection to the actual DB file/server.
+- **`check_same_thread=False`** — only needed for SQLite (since FastAPI can use multiple threads).
+- **`autocommit=False`** — you must call `db.commit()` yourself.
+- **`autoflush=False`** — SQLAlchemy won't auto-sync pending changes before every query.
 
-- `title` must be a string from 1 to 50 characters;
-- `author` must be a string from 1 to 20 characters; and
-- `content` must be a string with at least 1 character.
+**`Base`** — all models inherit from this; it collects table metadata so `Base.metadata.create_all()` can create tables.
 
-Because these fields have no default values, they are required. An absent field,
-an incorrect type, or a value that violates a `Field` rule causes validation to
-fail before the endpoint function runs.
+**`get_db()` — the dependency generator pattern:**
+```python
+def get_db():
+    with SessionLocal() as db:
+        yield db
+```
+- `yield` instead of `return` → this is a **generator**, used with FastAPI's `Depends()`.
+- Code before `yield` = setup, code after = teardown (cleanup runs even if request fails).
+- `with SessionLocal()` ensures the session auto-closes when done.
+- **Key concept:** one DB session per request, injected automatically.
 
-Important distinction:
+---
 
-- `str` checks the data type.
-- `min_length` and `max_length` check the size of a string.
-- `Field(...)` adds constraints and metadata to a field.
+## 3. model.py — ORM Models
 
+```python
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[int] = mapped_column(primary_key=True)
+```
+- `Mapped[type]` + `mapped_column()` = modern (SQLAlchemy 2.0 style) way to declare columns.
+- `nullable=False` = required field. `unique=True` = no duplicates.
 
-3. Request validation with PostCreate
---------------------------------------
-`PostCreate` inherits all fields and rules from `PostBase`:
+**Relationships (1-to-many: one User → many Posts):**
+```python
+# On User:
+posts: Mapped[list["Post"]] = relationship(back_populates="author", cascade="all, delete-orphan")
+# On Post:
+user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+author: Mapped["User"] = relationship(back_populates="posts")
+```
+- `ForeignKey` = actual DB-level link (column).
+- `relationship()` = Python-level convenience (lets you do `post.author` or `user.posts`).
+- `back_populates` = keeps both sides in sync.
+- `cascade="all, delete-orphan"` = deleting a user deletes their posts too.
 
-	class PostCreate(PostBase):
-		pass
+**Computed/derived attribute (not stored in DB):**
+```python
+@property
+def image_path(self):
+    ...
+```
+- A `@property` lets you add logic-based fields that aren't real columns but can still be read like `user.image_path`.
 
-The `pass` means that this model currently adds nothing new. It is still useful
-because it gives the incoming-create request its own meaningful name. Later, the
-create request could gain rules without changing the shared base model.
+---
 
-In `main.py`:
+## 4. schema.py — Pydantic Validation
 
-	@app.post("/api/posts", response_model=PostResponse)
-	def create_post(post: PostCreate):
+**Pattern: Base → Create → Update → Response**
+```python
+class UserBase(BaseModel):        # shared fields
+class UserCreate(UserBase):       # what's needed to create
+class UserUpdate(UserBase):       # all fields optional (for PATCH)
+class UserResponse(UserBase):     # what's sent back (adds id, etc.)
+```
+- This avoids repeating fields and keeps each schema's purpose clear.
+- `Field(min_length=, max_length=)` — validation constraints.
+- `EmailStr` — validates proper email format (needs `email-validator` package).
+- **`model_config = ConfigDict(from_attributes=True)`** — required so Pydantic can read data from an ORM object (not just dicts). Without this, returning a SQLAlchemy object from an endpoint would fail.
 
-The type annotation `post: PostCreate` tells FastAPI to treat the request body as
-JSON and validate it as a `PostCreate` object.
+**Optional fields for PATCH/partial update:**
+```python
+title: str | None = Field(default=None, ...)
+```
+- `None` default = field is optional; combined with `exclude_unset=True` (see below) to only update what was actually sent.
 
-Example valid request:
+---
 
-	{
-	  "title": "Learning FastAPI",
-	  "author": "A student",
-	  "content": "Pydantic checks my request data."
-	}
+## 5. main.py — Core FastAPI Concepts
 
-Example invalid requests include:
+### a) Dependency Injection
+```python
+def endpoint(db: Annotated[Session, Depends(get_db)]):
+```
+- `Depends(get_db)` tells FastAPI to call `get_db()` and inject its yielded value.
+- `Annotated[Type, Depends(...)]` is the modern syntax (Python 3.9+).
 
-- a missing `title`;
-- an empty `content`;
-- a title longer than 50 characters; or
-- an author longer than 20 characters.
+### b) Path operations & multiple routes → same function
+```python
+@app.get("/", name="home")
+@app.get("/posts", name="post")
+def home(...):
+```
+- Stacking decorators = same view function handles multiple URLs.
 
-For invalid request data, FastAPI normally returns HTTP 422 and does not call
-`create_post`. This protects the endpoint from operating on data that does not
-match its contract.
+### c) Query pattern (SQLAlchemy 2.0 style)
+```python
+result = db.execute(select(model.Post).where(model.Post.id == post_id))
+post = result.scalars().first()   # or .all()
+```
+- `select()` builds the query, `.execute()` runs it, `.scalars()` unwraps ORM objects, `.first()`/`.all()` fetches results.
 
+### d) Standard CRUD flow
+- **Create:** build object → `db.add()` → `db.commit()` → `db.refresh()` (refresh pulls back DB-generated values like `id`).
+- **Read:** `select()` + filter + `.first()`/`.all()`.
+- **Update (PUT = full replace):** fetch → overwrite all fields → commit.
+- **Update (PATCH = partial):** fetch → `data.model_dump(exclude_unset=True)` → loop with `setattr()` → commit.
+- **Delete:** fetch → `db.delete(obj)` → `db.commit()`.
 
-4. Response validation with PostResponse
-----------------------------------------
-`PostResponse` also inherits the three post fields, then adds fields required in
-an API response:
+### e) Validation before creation (uniqueness checks)
+Before creating/updating, manually query to check duplicates (username/email) and raise `HTTPException(400, ...)` if found — since DB-level `unique=True` alone would raise a raw DB error, not a clean API error.
 
-	class PostResponse(PostBase):
-		model_config = ConfigDict(from_attributes=True)
-		id: int
-		date_posted: str
+### f) `response_model=`
+```python
+@app.get("/api/posts", response_model=list[PostResponse])
+```
+- Filters/shapes the output — only fields defined in the schema go out, even if the ORM object has more.
+- Also auto-generates OpenAPI docs.
 
-Therefore, a response must contain:
+### g) HTTPException & status codes
+```python
+raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="...")
+```
+- Standard way to return errors with proper HTTP codes instead of generic 500s.
+- Common codes used: 200 (OK), 201 (Created), 204 (No Content – for deletes), 400 (Bad Request), 404 (Not Found), 422 (Unprocessable Entity – validation errors).
 
-- `id` as an integer;
-- `title` as a string from 1 to 50 characters;
-- `author` as a string from 1 to 20 characters;
-- non-empty `content`; and
-- `date_posted` as a string.
+### h) Templates (server-rendered HTML pages)
+```python
+templates = Jinja2Templates(directory="templates")
+return templates.TemplateResponse(request, "home.html", {"posts": posts, "title": title})
+```
+- Used for HTML pages (not pure API), passes data into Jinja templates.
+- `StaticFiles` mounts folders for CSS/JS/images (`/static`) and user-uploaded content (`/media`).
 
-`response_model=PostResponse` tells FastAPI to validate and serialize the value
-returned by the endpoint. It also filters the response to the fields declared by
-the model. This is useful because internal fields should not accidentally leak
-to API consumers.
+### i) Custom exception handlers
+```python
+@app.exception_handler(StarletteHTTPException)
+@app.exception_handler(RequestValidationError)
+```
+- Lets you customize error responses globally.
+- Common trick: check `request.url.path.startswith("/api")` to decide whether to return **JSON** (for API clients) or a **rendered HTML error page** (for browser users) — same error, two formats depending on caller.
 
-The create endpoint returns a newly built dictionary containing all required
-response fields. The list and single-post endpoints use the same response model:
+---
 
-	@app.get("/api/posts", response_model=list[PostResponse])
-	@app.get("/api/post/{post_id}", response_model=PostResponse)
+## 6. Key Concepts to Remember (Quick Recall List)
 
-The first route validates every item in the returned list. The second validates
-one returned post. If the application returns data that does not satisfy the
-response model, FastAPI raises a server-side response validation error. Request
-validation protects the application from the client; response validation
-protects the client from an incorrectly shaped API response.
+- Dependency injection (`Depends`) → decouples DB session creation from route logic.
+- Generator + `yield` in `get_db()` → setup/teardown pattern, auto-closes sessions.
+- SQLAlchemy 2.0 query style: `select()` → `execute()` → `.scalars()` → `.first()/.all()`.
+- Separate **ORM models** (storage) from **Pydantic schemas** (API contract).
+- `from_attributes=True` needed to serialize ORM objects via Pydantic.
+- Base/Create/Update/Response schema pattern avoids duplication.
+- `exclude_unset=True` → enables true partial updates (PATCH).
+- Always manually check uniqueness before insert if DB has `unique=True` constraints, to return clean 400 errors.
+- `response_model` shapes and validates what actually leaves the API.
+- Custom exception handlers let one app serve both JSON (API) and HTML (web pages) errors.
+- Relationships (`relationship`, `back_populates`, `cascade`) link tables at the Python level; `ForeignKey` links them at the DB level.
 
+---
 
-5. Request validation versus response validation
-------------------------------------------------
+## 7. Things to Double-Check / Common Bugs (from this code, for learning)
 
-Request validation:
+- In `update_user`, comparing `update_data.email != update_data.email` will always be `False` — should compare against `user.email`.
+- In `get_user_post`, the initial query filters `model.User` but compares `model.Post.user_id` — mismatched model/condition. Should filter `model.User.id == user_id`.
+- Returning `HTTPException(...)` instead of `raise HTTPException(...)` won't actually stop execution or return an error response — must always `raise`.
+- In `patch_post`, `Patch_post.model_dump(...)` is called on the class instead of the instance `patch_data.model_dump(...)`.
 
-- happens before the endpoint function runs;
-- uses `post: PostCreate`;
-- checks client input; and
-- normally produces HTTP 422 for invalid input.
-
-Response validation:
-
-- happens after the endpoint function returns;
-- uses `response_model=PostResponse` or `list[PostResponse]`;
-- checks the server's output; and
-- documents and controls the public response shape.
-
-Simple flow:
-
-	Client JSON -> PostCreate validation -> endpoint function
-				-> Python dictionary -> PostResponse validation -> Client JSON
-
-
-6. Custom validation error handling
------------------------------------
-`main.py` registers:
-
-	@app.exception_handler(RequestValidationError)
-
-When FastAPI rejects request data, `exception.errors()` contains structured
-details such as the location of the bad value, the error type, and a message.
-
-For API routes, the handler returns JSON with status 422:
-
-	{"details": exception.errors()}
-
-For browser/template routes, it renders `error.html` instead. This is a good
-example of choosing an error format based on the kind of client making the
-request.
-
-The other handler, for `StarletteHTTPException`, handles errors such as a missing
-post. API clients receive JSON, while normal web pages receive the error template.
-
-
-7. `from_attributes=True`
--------------------------
-`ConfigDict(from_attributes=True)` allows Pydantic to create a response model
-from object attributes, not only from dictionaries. This is especially useful
-when an application later returns ORM/database objects such as `post.id` and
-`post.title`.
-
-The current application returns dictionaries, so the setting is harmless and
-keeps the response model ready for database integration.
-
-
-8. Important observations in this example
-------------------------------------------
-
-- `PostCreate` is for input and intentionally has no `id` or `date_posted`.
-- `PostResponse` is for output and requires `id` and `date_posted`.
-- The create endpoint currently creates `date_posted` itself instead of asking
-  the client to provide it. This is usually the safer design because the server
-  controls generated metadata.
-- In `create_post`, the expression `max(p["id"] for p in posts) + 1 if post else 1`
-  checks `post`, which is a request object and is normally truthy. Conceptually,
-  an empty-list check should examine `posts`, not `post`, otherwise `max()` would
-  fail when the storage list is empty.
-- There are two Python functions named `get_posts`. The later definition replaces
-  the earlier Python name, even though FastAPI has already registered the routes.
-  Different function names would make the code clearer.
-
-
-9. Mental model
----------------
-Think of Pydantic as a gatekeeper and a formatter:
-
-- before the endpoint: it checks whether client data is acceptable;
-- after the endpoint: it checks whether server data matches the promised API;
-- in both directions: it gives the data a predictable, documented shape.
-
-This separation makes APIs easier to test, safer to change, and easier for other
-developers to use.
+*(Good to review these later — they're common mistakes to watch out for while practicing CRUD APIs.)*
